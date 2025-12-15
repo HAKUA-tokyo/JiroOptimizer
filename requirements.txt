@@ -1,6 +1,6 @@
 streamlit
-neal
-pyqubo
-plotly
 pandas
+plotly
+pyqubo
 dwave-neal
+numpy
