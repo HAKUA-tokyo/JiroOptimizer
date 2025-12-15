@@ -1,0 +1,6 @@
+streamlit
+neal
+pyqubo
+plotly
+pandas
+dwave-neal
