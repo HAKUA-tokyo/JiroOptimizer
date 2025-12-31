@@ -3,4 +3,4 @@ pandas
 plotly
 pyqubo
 dwave-neal
-numpy
+numpy<2.0.0
