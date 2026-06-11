@@ -4,6 +4,8 @@ from pyqubo import Array, Constraint, LogEncInteger
 import plotly.graph_objects as go
 import os
 import urllib.parse
+import itertools
+import pandas as pd
 
 # --- ページ設定 ---
 st.set_page_config(page_title="Jiro Order Optimizer", layout="wide")
@@ -144,12 +146,301 @@ def calculate_details(selected_items, weights):
         diet_bonus = 30 
 
     final_score = weighted_satisfaction + diet_bonus - randle_penalty
-    
+    garlic_level = 0
+    fat_level = 0
+    pork_level = 0
+    soup_level = 0
+
+    if "ニンニク少なめ" in selected_items:
+        garlic_level = 1
+    elif "ニンニク普通" in selected_items:
+        garlic_level = 2
+    elif "ニンニク増し" in selected_items:
+        garlic_level = 3
+
+    if "アブラ普通" in selected_items:
+        fat_level = 1
+    elif "アブラマシ" in selected_items:
+        fat_level = 2
+    elif "アブラマシマシ" in selected_items:
+        fat_level = 3
+
+    if "豚増し(5枚)" in selected_items:
+        pork_level = 1
+    elif "豚ダブル(8枚)" in selected_items:
+        pork_level = 2
+
+    if "★スープ完飲(K.K.)" in selected_items:
+        soup_level = 1
+
+    indulgence = (
+        total_cal / 35
+        + total_sodium * 5
+        + fat_level * 18
+        + pork_level * 16
+        + garlic_level * 10
+        + soup_level * 45
+    )
+    next_day_damage = (
+        total_sodium * 7
+        + total_cal / 50
+        + garlic_level * 20
+        + fat_level * 14
+        + soup_level * 35
+    )
+    social_risk = garlic_level * 30 + soup_level * 10
+    regret_risk = max(0, total_cal - 1800) / 20 + max(0, total_sodium - 8.0) * 14 + fat_level * 5
+
     return {
         "cal": total_cal, "sodium": total_sodium, "price": total_price,
         "base_sat": weighted_satisfaction, "randle_penalty": randle_penalty,
-        "diet_bonus": diet_bonus, "final_score": final_score
+        "diet_bonus": diet_bonus, "final_score": final_score,
+        "indulgence": indulgence, "next_day_damage": next_day_damage,
+        "social_risk": social_risk, "regret_risk": regret_risk
     }
+
+def generate_all_orders(weights):
+    category_items = {
+        cat: [name for name, data in items_data.items() if data["cat"] == cat]
+        for cat in target_categories
+    }
+    optional_items = [name for name, data in items_data.items() if data["cat"] in ["soup_option", "topping"]]
+    candidates = []
+
+    for base_items in itertools.product(*(category_items[cat] for cat in target_categories)):
+        for mask in range(2 ** len(optional_items)):
+            selected = list(base_items)
+            selected.extend(optional_items[i] for i in range(len(optional_items)) if mask & (1 << i))
+            stats = calculate_details(selected, weights)
+            candidates.append({
+                "items": selected,
+                "order": " / ".join(selected),
+                **stats
+            })
+    return candidates
+
+def mark_pareto_front(candidates):
+    for candidate in candidates:
+        candidate["is_pareto"] = True
+
+    for i, candidate in enumerate(candidates):
+        for j, other in enumerate(candidates):
+            if i == j:
+                continue
+            no_worse = (
+                other["final_score"] >= candidate["final_score"]
+                and other["cal"] <= candidate["cal"]
+                and other["sodium"] <= candidate["sodium"]
+                and other["price"] <= candidate["price"]
+            )
+            strictly_better = (
+                other["final_score"] > candidate["final_score"]
+                or other["cal"] < candidate["cal"]
+                or other["sodium"] < candidate["sodium"]
+                or other["price"] < candidate["price"]
+            )
+            if no_worse and strictly_better:
+                candidate["is_pareto"] = False
+                break
+    return candidates
+
+def draw_pareto_chart(candidates, limits):
+    df = pd.DataFrame(candidates)
+    df["status"] = df["is_pareto"].map({True: "境界上の候補", False: "候補"})
+    df["limit_ok"] = (df["cal"] <= limits["cal"]) & (df["sodium"] <= limits["sodium"]) & (df["price"] <= limits["price"])
+    df["marker_size"] = (df["cal"] / df["cal"].max() * 20).clip(lower=6)
+
+    frontier = df.sort_values(["next_day_damage", "final_score"]).copy()
+    frontier["best_so_far"] = frontier["final_score"].cummax()
+    frontier = frontier[frontier["final_score"] >= frontier["best_so_far"]]
+
+    fig = go.Figure()
+    for status, color, opacity in [("候補", "#7f8c8d", 0.22), ("境界上の候補", "#F4D03F", 0.9)]:
+        sub = df[df["status"] == status]
+        fig.add_trace(go.Scatter(
+            x=sub["next_day_damage"], y=sub["final_score"],
+            mode="markers", name=status,
+            marker=dict(
+                size=sub["marker_size"], color=sub["sodium"],
+                colorscale="Turbo", showscale=(status == "境界上の候補"),
+                colorbar=dict(title=dict(text="塩分(g)", side="right"), x=1.05, len=0.78),
+                line=dict(width=1, color=color), opacity=opacity
+            ),
+            customdata=sub[["price", "cal", "sodium", "indulgence", "order", "limit_ok"]],
+            hovertemplate=(
+                "満足度=%{y:.1f}<br>翌日の重さ=%{x:.1f}"
+                "<br>価格=%{customdata[0]}円 / カロリー=%{customdata[1]}kcal / 塩分=%{customdata[2]:.1f}g"
+                "<br>背徳度=%{customdata[3]:.1f}<br>%{customdata[4]}<extra></extra>"
+            )
+        ))
+
+    fig.add_trace(go.Scatter(
+        x=frontier["next_day_damage"],
+        y=frontier["final_score"],
+        mode="lines",
+        name="トレードオフ境界",
+        line=dict(color="#F4D03F", width=4),
+        hovertemplate="少ない負担で満足度を上げられる候補のラインです<extra></extra>"
+    ))
+
+    fig.update_layout(
+        title="満足度と翌日の重さ",
+        xaxis_title="翌日の重さ",
+        yaxis_title="満足度スコア",
+        height=470,
+        margin=dict(l=60, r=135, t=78, b=95),
+        legend=dict(orientation="h", x=0, y=-0.22, xanchor="left", yanchor="top"),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)'
+    )
+    fig.add_annotation(
+        xref="paper", yref="paper", x=0, y=1.08, showarrow=False, align="left",
+        text="左上ほど、軽めなのに満足できる注文です。黄色の線は、満足度と負担のちょうどよい境目です。",
+        font=dict(size=13, color="#b8bcc6")
+    )
+    return fig
+
+def draw_qubo_interaction_graph(weights):
+    category_order = ["noodle", "pork", "vege", "fat", "garlic", "soup_option", "topping"]
+    category_labels = {
+        "noodle": "麺", "pork": "豚", "vege": "ヤサイ", "fat": "アブラ",
+        "garlic": "ニンニク", "soup_option": "スープ", "topping": "追加"
+    }
+    short_labels = {
+        "麺通常(300g)": "麺300", "麺少なめ(200g)": "麺200", "麺半分(150g)": "麺150",
+        "豚(2枚・標準)": "豚2", "豚増し(5枚)": "豚5", "豚ダブル(8枚)": "豚8",
+        "ヤサイ少なめ": "少なめ", "ヤサイ普通": "普通", "ヤサイマシ": "マシ", "ヤサイマシマシ": "マシマシ",
+        "アブラ無し": "なし", "アブラ普通": "普通", "アブラマシ": "マシ", "アブラマシマシ": "マシマシ",
+        "ニンニク無し": "なし", "ニンニク少なめ": "少なめ", "ニンニク普通": "普通", "ニンニク増し": "増し",
+        "★スープ完飲(K.K.)": "完飲", "生卵": "生卵", "うずら(5個)": "うずら"
+    }
+    category_y = {cat: len(category_order) - idx for idx, cat in enumerate(category_order)}
+    x_positions = {}
+    nodes = []
+
+    for cat in category_order:
+        names = [name for name, data in items_data.items() if data["cat"] == cat]
+        for idx, name in enumerate(names):
+            x_positions[name] = idx - (len(names) - 1) / 2
+            nodes.append({
+                "name": name,
+                "cat_label": category_labels[cat],
+                "short": short_labels.get(name, name),
+                "x": x_positions[name],
+                "y": category_y[cat],
+                "weight": items_data[name]["satisfaction"] * weights.get("topping" if cat in ["soup_option", "topping"] else cat, 1.0)
+            })
+
+    edge_traces = []
+    interactions = []
+    for c_item in high_carb_items:
+        for f_item in high_fat_items:
+            interactions.append((c_item, f_item, "重くなりやすい", "#e74c3c", 50))
+    for l_item in low_carb_items:
+        for v_item in volumey_vege:
+            interactions.append((l_item, v_item, "軽くまとまる", "#2ecc71", -30))
+
+    shown_labels = set()
+    for src, dst, label, color, value in interactions:
+        if src not in x_positions or dst not in x_positions:
+            continue
+        edge_traces.append(go.Scatter(
+            x=[x_positions[src], x_positions[dst]],
+            y=[category_y[items_data[src]["cat"]], category_y[items_data[dst]["cat"]]],
+            mode="lines",
+            line=dict(color=color, width=4 if value > 0 else 3, dash="solid" if value > 0 else "dot"),
+            hoverinfo="text",
+            text=f"{label}: {src} × {dst}",
+            name=label,
+            legendgroup=label,
+            showlegend=label not in shown_labels
+        ))
+        shown_labels.add(label)
+
+    node_df = pd.DataFrame(nodes)
+    fig = go.Figure(edge_traces)
+    fig.add_trace(go.Scatter(
+        x=node_df["x"], y=node_df["y"],
+        mode="markers+text",
+        text=node_df["short"],
+        textposition="middle center",
+        marker=dict(
+            size=(node_df["weight"] / max(node_df["weight"].max(), 1) * 44 + 18),
+            color=node_df["weight"],
+            colorscale="Viridis",
+            line=dict(color="#111", width=1),
+            colorbar=dict(title=dict(text="欲しさ", side="right"), x=1.05, len=0.78)
+        ),
+        textfont=dict(size=11, color="white"),
+        customdata=node_df[["name", "cat_label", "weight"]],
+        hovertemplate="%{customdata[0]}<br>カテゴリ=%{customdata[1]}<br>単体の欲しさ=%{customdata[2]:.1f}<extra></extra>",
+        name="選択肢"
+    ))
+    for cat in category_order:
+        fig.add_annotation(
+            xref="x", yref="y", x=-2.9, y=category_y[cat],
+            text=category_labels[cat], showarrow=False,
+            font=dict(size=13, color="#b8bcc6"), align="right"
+        )
+    fig.update_layout(
+        title="選択肢どうしの相性",
+        xaxis=dict(visible=False, range=[-3.2, 3.0]),
+        yaxis=dict(visible=False),
+        height=560,
+        margin=dict(l=105, r=135, t=88, b=95),
+        legend=dict(orientation="h", x=0, y=-0.16, xanchor="left", yanchor="top"),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)'
+    )
+    fig.add_annotation(
+        xref="paper", yref="paper", x=0, y=1.08, showarrow=False, align="left",
+        text="点が大きいほど、今日の気分に合う選択肢です。赤線は重くなりやすい組み合わせ、緑線は軽くまとまりやすい組み合わせです。",
+        font=dict(size=13, color="#b8bcc6")
+    )
+    return fig
+
+def get_best_candidate(candidates, limits, required_items=None, forbidden_items=None):
+    required_items = required_items or []
+    forbidden_items = forbidden_items or []
+    feasible = [
+        c for c in candidates
+        if c["price"] <= limits["price"]
+        and c["cal"] <= limits["cal"]
+        and c["sodium"] <= limits["sodium"]
+        and all(item in c["items"] for item in required_items)
+        and all(item not in c["items"] for item in forbidden_items)
+    ]
+    return max(feasible, key=lambda c: (c["final_score"], -c["next_day_damage"])) if feasible else None
+
+def build_counterfactual_rows(candidates, limits):
+    scenarios = [
+        ("現在条件", limits, [], []),
+        ("予算 +100円", {**limits, "price": limits["price"] + 100}, [], []),
+        ("カロリー -300kcal", {**limits, "cal": max(0, limits["cal"] - 300)}, [], []),
+        ("塩分 -1.0g", {**limits, "sodium": max(0, limits["sodium"] - 1.0)}, [], []),
+        ("ニンニク禁止", limits, [], ["ニンニク少なめ", "ニンニク普通", "ニンニク増し"]),
+        ("豚増し固定", limits, ["豚増し(5枚)"], []),
+    ]
+    rows = []
+    base = get_best_candidate(candidates, limits)
+    base_score = base["final_score"] if base else 0
+
+    for name, scenario_limits, required, forbidden in scenarios:
+        best = get_best_candidate(candidates, scenario_limits, required, forbidden)
+        if not best:
+            rows.append({"シナリオ": name, "最適オーダー": "該当なし", "満足度差": None, "価格": None, "カロリー": None, "塩分": None})
+            continue
+        rows.append({
+            "シナリオ": name,
+            "最適オーダー": " / ".join(best["items"]),
+            "満足度差": round(best["final_score"] - base_score, 1),
+            "価格": int(best["price"]),
+            "カロリー": int(best["cal"]),
+            "塩分": round(best["sodium"], 1),
+            "背徳度": round(best["indulgence"], 1),
+            "翌日の重さ": round(best["next_day_damage"], 1),
+        })
+    return pd.DataFrame(rows)
 
 def create_gauge(value, user_limit, title, suffix, mode="standard"):
     bar_color = "#1f77b4"
@@ -377,6 +668,29 @@ if solve_btn:
 
     u_stats = calculate_details(user_selection, weights_map) if enable_comparison and user_selection else None
     limits = {"cal": cal_limit, "sodium": sodium_limit, "price": budget}
+    all_candidates = mark_pareto_front(generate_all_orders(weights_map))
+    feasible_candidates = [
+        c for c in all_candidates
+        if c["price"] <= budget and c["cal"] <= cal_limit and c["sodium"] <= sodium_limit
+    ]
+
+    st.markdown("### 🧭 オーダー分析")
+    lab_tabs = st.tabs(["バランスを見る", "相性を見る", "条件を変える"])
+
+    with lab_tabs[0]:
+        st.caption("満足度を上げると、どれくらい重くなるのかを見比べます。黄色の線に近いほど、満足度と負担のバランスがよい注文です。")
+        st.plotly_chart(draw_pareto_chart(all_candidates, limits), use_container_width=True)
+        pareto_count = sum(1 for c in all_candidates if c["is_pareto"])
+        st.caption(f"候補は全部で {len(all_candidates)} 件。いまの条件内で選べる注文は {len(feasible_candidates)} 件です。")
+
+    with lab_tabs[1]:
+        st.caption("どの選択肢が効いているか、どの組み合わせが重くなりやすいかを見ます。点は選択肢、線は組み合わせのクセです。")
+        st.plotly_chart(draw_qubo_interaction_graph(weights_map), use_container_width=True)
+
+    with lab_tabs[2]:
+        st.caption("予算やカロリーなどを少し変えた場合に、おすすめがどう変わるかを比べます。")
+        counterfactual_df = build_counterfactual_rows(all_candidates, limits)
+        st.dataframe(counterfactual_df, use_container_width=True, hide_index=True)
     
     tabs = st.tabs([f"🏆 プラン A (Best)" if i==0 else f"プラン {chr(65+i)}" for i in range(len(final_plans))])
     
@@ -417,6 +731,8 @@ if solve_btn:
             with col_score:
                 st.markdown('<div class="big-score-label">満足度スコア (Objective)</div>', unsafe_allow_html=True)
                 st.markdown(f'<div class="big-score">{stats["final_score"]:.1f}</div>', unsafe_allow_html=True)
+                st.metric("背徳度", f"{stats['indulgence']:.1f}")
+                st.metric("翌日の重さ", f"{stats['next_day_damage']:.1f}")
                 if u_stats and u_stats['final_score'] > 0:
                     diff = stats['final_score'] - u_stats['final_score']
                     pct = (diff / u_stats['final_score']) * 100
@@ -445,8 +761,10 @@ if solve_btn:
                 tags_html += '</div>'
                 st.markdown(tags_html, unsafe_allow_html=True)
                 
-                if stats["randle_penalty"] > 0: st.warning(f"⚠️ 糖質×脂質 ペナルティ (-{stats['randle_penalty']})")
-                if stats["diet_bonus"] > 0: st.success(f"✨ 減量シナジー ボーナス (+{stats['diet_bonus']})")
+                if stats["randle_penalty"] > 0: st.warning(f"重くなりやすい組み合わせ (-{stats['randle_penalty']})")
+                if stats["diet_bonus"] > 0: st.success(f"軽くまとまりやすい組み合わせ (+{stats['diet_bonus']})")
+                if stats["social_risk"] > 60: st.warning(f"ニンニク注意度: {stats['social_risk']:.1f}")
+                if stats["regret_risk"] > 30: st.warning(f"食後の重さ: {stats['regret_risk']:.1f}")
             
             st.markdown("---")
             tweet_text = f"【Jiro Order Optimizer】\n私の最適化プラン: {final_call}\n💰 {int(stats['price'])}円 | 🔥 {int(stats['cal'])}kcal | 🧂 {stats['sodium']:.1f}g\n満足度スコア: {stats['final_score']:.1f}\n#JiroOrderOptimizer"
